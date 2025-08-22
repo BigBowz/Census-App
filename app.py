@@ -1,18 +1,58 @@
-import streamlit as st
-import pandas as pd
+import os
+import re
 from io import BytesIO
 from datetime import datetime
-import re
+
+import pandas as pd
+import streamlit as st
 from openpyxl import load_workbook
 
 from amplify_census_input import normalize_and_validate
 from export_aetna_afa import export_to_aetna_afa
 
+# -----------------------
+# Simple password gate
+# -----------------------
+def check_password() -> bool:
+    """
+    Single-password gate.
+    Default password is 'Amplify#1', but you can override by setting:
+      - Streamlit secret:   app_password = "..."
+      - or env var:        APP_PASSWORD=...
+    """
+    expected = (
+        st.secrets.get("app_password")
+        or os.environ.get("APP_PASSWORD")
+        or "Amplify#1"
+    )
+
+    if st.session_state.get("auth_ok"):
+        return True
+
+    st.title("Census Converter 🔐")
+    pw = st.text_input("Enter password", type="password")
+    if st.button("Enter"):
+        st.session_state["auth_ok"] = (pw == expected)
+        if not st.session_state["auth_ok"]:
+            st.error("Incorrect password")
+            st.stop()
+    else:
+        st.stop()
+    return True
+
+# Call gate BEFORE any other UI
+check_password()
+
+# -----------------------
+# Streamlit page config
+# -----------------------
 st.set_page_config(page_title="Census Converter", layout="wide")
 st.title("Census Converter")
 st.caption("Upload → Pick Sheet & Rows → Normalize & Validate → Convert → Download")
 
-# ---------- helpers to read cells & build filename ----------
+# -----------------------
+# Helpers
+# -----------------------
 def read_sheet_fields(file_bytes: bytes, sheet_name: str) -> dict:
     """
     Read company/address/fein/sic from the original uploaded sheet:
@@ -47,7 +87,9 @@ def sanitize_filename_component(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s or "Unknown Company"
 
-
+# -----------------------
+# App body
+# -----------------------
 uploaded = st.file_uploader("Upload census Excel (.xlsx)", type=["xlsx"])
 
 if uploaded is not None:
@@ -161,6 +203,6 @@ if uploaded is not None:
 
 st.markdown("---")
 st.caption(
-    "Filename uses C5 + today’s date. Output header cells: A1/D1 Company, A2/D2 Address, "
-    "A3/D3 FEIN, A4/D4 SIC. A5 shows totals. Table headers on row 7; data starts row 8."
+    "Password protected. Filename uses C5 + today’s date. Output header cells: A1/D1 Company, "
+    "A2/D2 Address, A3/D3 FEIN, A4/D4 SIC. A5 shows totals. Table headers on row 7; data starts row 8."
 )
