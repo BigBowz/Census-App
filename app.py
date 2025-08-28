@@ -5,20 +5,24 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook
 
 from amplify_census_input import normalize_and_validate
 from export_aetna_afa import export_to_aetna_afa
 
-# -----------------------
-# Simple password gate
-# -----------------------
+# --------------------------------
+# Page config FIRST (important)
+# --------------------------------
+st.set_page_config(page_title="Census Converter", layout="wide")
+
+# --------------------------------
+# Simple password gate (default Amplify#1; override via secret/env)
+# --------------------------------
 def check_password() -> bool:
     """
     Single-password gate.
-    Default password is 'Amplify#1', but you can override by setting:
-      - Streamlit secret:   app_password = "..."
-      - or env var:        APP_PASSWORD=...
+    Default is 'Amplify#1', but you can override with:
+      - Streamlit secret: app_password = "..."
+      - Env var:          APP_PASSWORD=...
     """
     expected = (
         st.secrets.get("app_password")
@@ -40,27 +44,47 @@ def check_password() -> bool:
         st.stop()
     return True
 
-# Call gate BEFORE any other UI
+# Call gate BEFORE rendering the rest of the app
 check_password()
 
-# -----------------------
-# Streamlit page config
-# -----------------------
-st.set_page_config(page_title="Census Converter", layout="wide")
 st.title("Census Converter")
 st.caption("Upload → Pick Sheet & Rows → Normalize & Validate → Convert → Download")
 
-# -----------------------
-# Helpers
-# -----------------------
+# --------------------------------
+# Helpers (with caching)
+# --------------------------------
+def _clean_str(v) -> str:
+    s = "" if v is None else str(v).strip()
+    return re.sub(r"\s+", " ", s)
+
+@st.cache_data(show_spinner=False)
+def get_sheet_names(file_bytes: bytes):
+    """Return list of sheet names from an Excel file (cached)."""
+    return pd.ExcelFile(BytesIO(file_bytes)).sheet_names
+
+@st.cache_data(show_spinner=False)
+def read_raw_preview(file_bytes: bytes, sheet: str, nrows: int = 30) -> pd.DataFrame:
+    """Read first N rows without headers for visual selection (cached)."""
+    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=nrows)
+
+@st.cache_data(show_spinner=False)
+def parse_with_rows(file_bytes: bytes, sheet: str, header_row_excel: int, first_data_row_excel: int) -> pd.DataFrame:
+    """Parse using chosen header row & first data row (cached)."""
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=int(header_row_excel - 1))
+    start_offset = int(first_data_row_excel - (header_row_excel + 1))
+    if start_offset > 0:
+        df = df.iloc[start_offset:].reset_index(drop=True)
+    return df
+
 def read_sheet_fields(file_bytes: bytes, sheet_name: str) -> dict:
     """
-    Read company/address/fein/sic from the original uploaded sheet:
+    Read company/address/fein/sic from the uploaded workbook (lazy import).
       C5 -> company
       C6 -> address
       C8 -> fein
       E7 -> sic
     """
+    from openpyxl import load_workbook  # lazy import to speed cold starts
     wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
     try:
         ws = wb[sheet_name]
@@ -70,26 +94,36 @@ def read_sheet_fields(file_bytes: bytes, sheet_name: str) -> dict:
         sic     = ws["E7"].value
     finally:
         wb.close()
-
-    def _clean(v):
-        s = "" if v is None else str(v).strip()
-        return re.sub(r"\s+", " ", s)
-
     return {
-        "company": _clean(company),
-        "address": _clean(address),
-        "fein":    _clean(fein),
-        "sic":     _clean(sic),
+        "company": _clean_str(company),
+        "address": _clean_str(address),
+        "fein":    _clean_str(fein),
+        "sic":     _clean_str(sic),
     }
+
+@st.cache_data(show_spinner=False)
+def read_meta_fields_cached(file_bytes: bytes, sheet: str) -> dict:
+    """Cached wrapper for header cells (C5/C6/C8/E7)."""
+    return read_sheet_fields(file_bytes, sheet)
+
+@st.cache_data(show_spinner=False)
+def normalize_cached(df: pd.DataFrame):
+    """Cached normalization + validation."""
+    return normalize_and_validate(df)
+
+@st.cache_data(show_spinner=False)
+def convert_cached(norm_df: pd.DataFrame, meta: dict) -> bytes:
+    """Cached conversion to Aetna AFA bytes."""
+    return export_to_aetna_afa(norm_df, meta=meta)
 
 def sanitize_filename_component(s: str) -> str:
     s = re.sub(r'[\\/:*?"<>|]+', "", s or "")
     s = re.sub(r"\s+", " ", s).strip()
     return s or "Unknown Company"
 
-# -----------------------
+# --------------------------------
 # App body
-# -----------------------
+# --------------------------------
 uploaded = st.file_uploader("Upload census Excel (.xlsx)", type=["xlsx"])
 
 if uploaded is not None:
@@ -97,8 +131,7 @@ if uploaded is not None:
 
     # 1) Sheet picker
     try:
-        xls = pd.ExcelFile(BytesIO(file_bytes))
-        sheets = xls.sheet_names
+        sheets = get_sheet_names(file_bytes)
     except Exception as e:
         st.error(f"Could not open workbook: {e}")
         st.stop()
@@ -109,9 +142,9 @@ if uploaded is not None:
         with colA:
             sheet = st.selectbox("Sheet", options=sheets, index=0)
 
-        # Raw preview to help pick header/data rows (no header)
+        # Raw preview (no header) to help pick rows
         try:
-            raw_preview = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=30)
+            raw_preview = read_raw_preview(file_bytes, sheet)
         except Exception as e:
             st.error(f"Could not read preview: {e}")
             st.stop()
@@ -136,15 +169,9 @@ if uploaded is not None:
                 help="Usually header + 1",
             )
 
-        # Parse with selected rows
+        # Parse with selections
         try:
-            parsed_df = pd.read_excel(
-                BytesIO(file_bytes), sheet_name=sheet, header=int(header_row_excel - 1)
-            )
-            # If user says data starts later than header+1, drop those extra rows
-            start_offset = int(first_data_row_excel - (header_row_excel + 1))
-            if start_offset > 0:
-                parsed_df = parsed_df.iloc[start_offset:].reset_index(drop=True)
+            parsed_df = parse_with_rows(file_bytes, sheet, int(header_row_excel), int(first_data_row_excel))
         except Exception as e:
             st.error(f"Could not parse with selected rows: {e}")
             st.stop()
@@ -152,15 +179,15 @@ if uploaded is not None:
         st.write("**Parsed preview with your header/data selection (first 20 rows)**")
         st.dataframe(parsed_df.head(20), use_container_width=True)
 
-    # Read metadata from the same selected sheet for header cells + filename
-    meta = read_sheet_fields(file_bytes, sheet)
+    # 2) Read meta fields (for header cells + filename)
+    meta = read_meta_fields_cached(file_bytes, sheet)
     company_for_name = sanitize_filename_component(meta.get("company", ""))
     date_str = datetime.now().date().isoformat()
     out_filename = f"Amplify AFA Census for {company_for_name} {date_str}.xlsx"
 
-    # 2) Normalize & validate per business rules
+    # 3) Normalize & validate
     try:
-        norm_df, issues_df = normalize_and_validate(parsed_df)
+        norm_df, issues_df = normalize_cached(parsed_df)
     except Exception as e:
         st.error(f"Normalization error: {e}")
         st.stop()
@@ -181,12 +208,11 @@ if uploaded is not None:
     else:
         st.success("No validation issues found.")
 
-    # 3) Convert → Aetna AFA (pass meta for header cells A1/D1..A4/D4 and totals in A5)
+    # 4) Convert → Aetna AFA
     with st.spinner("Converting…"):
-        out_bytes = export_to_aetna_afa(norm_df, meta=meta)
+        out_bytes = convert_cached(norm_df, meta)
 
-    # 4) Output preview
-    # NOTE: headers are on Excel row 7 now, so header=6 (0-based)
+    # 5) Output preview (headers are on row 7 → header=6)
     try:
         out_preview = pd.read_excel(BytesIO(out_bytes), sheet_name="Census Input", header=6)
         st.subheader("Converted output preview (first 15 rows)")
@@ -203,6 +229,7 @@ if uploaded is not None:
 
 st.markdown("---")
 st.caption(
-    "Password protected. Filename uses C5 + today’s date. Output header cells: A1/D1 Company, "
-    "A2/D2 Address, A3/D3 FEIN, A4/D4 SIC. A5 shows totals. Table headers on row 7; data starts row 8."
+    "Caching enabled for preview/parse/normalize/convert. Filename uses C5 + today’s date. "
+    "Output cells: A1/D1 Company, A2/D2 Address, A3/D3 FEIN, A4/D4 SIC, A5 totals. "
+    "Headers on row 7; data starts row 8."
 )
